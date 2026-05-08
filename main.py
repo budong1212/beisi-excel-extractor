@@ -225,13 +225,12 @@ class BeisiExcelExtractor:
     def _select_files(self):
         paths = filedialog.askopenfilenames(
             title="选择 Excel 文件",
-            filetypes=[("Excel 文件", "*.xlsx *.xls *.xlsm"), ("所有文件", "*.*")],
+            filetypes=[("Excel 文件", "*.xlsx *.xlsm"), ("所有文件", "*.*")],
         )
         self._add_files(list(paths))
 
     def _on_drop(self, event):
         raw = event.data
-        # tkinterdnd2 返回的路径可能被花括号包裹
         paths = self.root.tk.splitlist(raw)
         self._add_files(list(paths))
 
@@ -239,6 +238,13 @@ class BeisiExcelExtractor:
         for p in paths:
             p = p.strip()
             if p and p not in self.files:
+                ext = os.path.splitext(p)[1].lower()
+                if ext == ".xls":
+                    messagebox.showwarning(
+                        "格式不支持",
+                        f"文件 {os.path.basename(p)} 为旧版 .xls 格式，请先转换为 .xlsx 后再处理。",
+                    )
+                    continue
                 self.files.append(p)
                 self.file_listbox.insert(tk.END, os.path.basename(p))
         self.file_count_label.config(text=f"已选 {len(self.files)} 个文件")
@@ -290,8 +296,9 @@ class BeisiExcelExtractor:
         total = len(files)
         col = self.col_letter.get().strip().upper()
         col_idx = self._col_letter_to_index(col)
-        s = self.start_pos.get() - 1  # 转为0-based
-        e = self.end_pos.get()        # slice用法 [s:e]
+        # 起始位/结束位均为1-based，转为Python切片的0-based索引
+        s = self.start_pos.get() - 1   # 转为0-based
+        e = self.end_pos.get()          # end_pos本身是包含的第几位，切片时end = end_pos（不减1）
         out_dir = self.output_dir.get()
         has_header = self.has_header.get()
         has_footer = self.has_footer.get()
@@ -305,7 +312,6 @@ class BeisiExcelExtractor:
             self._update_progress(i, total, f"正在处理: {fname}", start_time, i)
 
             try:
-                ext = os.path.splitext(fpath)[1].lower()
                 wb = openpyxl.load_workbook(fpath, data_only=True)
                 for ws in wb.worksheets:
                     all_rows = list(ws.iter_rows())
@@ -319,11 +325,9 @@ class BeisiExcelExtractor:
                         if col_idx < len(row):
                             cell = row[col_idx]
                             val = str(cell.value) if cell.value is not None else ""
-                            extracted = val[s:e]
-                            cell.value = extracted
+                            cell.value = val[s:e]
 
                 out_path = os.path.join(out_dir, fname)
-                # 避免覆盖同名：自动加序号
                 base, suffix = os.path.splitext(out_path)
                 counter = 1
                 while os.path.exists(out_path):
@@ -343,14 +347,11 @@ class BeisiExcelExtractor:
         elapsed = time.time() - start_time
         speed = processed / elapsed if elapsed > 0 and processed > 0 else 0
         speed_text = f"{speed:.1f} 文件/秒" if speed > 0 else ""
-        self.root.after(
-            0,
-            lambda: (
-                self.progress_bar.configure(value=pct),
-                self.progress_label.config(text=msg),
-                self.speed_label.config(text=speed_text),
-            ),
-        )
+
+        # FIX: 使用独立 after 调用，避免 lambda 逗号表达式返回元组导致控件不更新
+        self.root.after(0, lambda v=pct: self.progress_bar.configure(value=v))
+        self.root.after(0, lambda m=msg: self.progress_label.config(text=m))
+        self.root.after(0, lambda st=speed_text: self.speed_label.config(text=st))
 
     def _finish(self, errors):
         self.processing = False
