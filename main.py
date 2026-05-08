@@ -1,6 +1,7 @@
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import openpyxl
+import xlrd
 import os
 import threading
 import time
@@ -225,7 +226,7 @@ class BeisiExcelExtractor:
     def _select_files(self):
         paths = filedialog.askopenfilenames(
             title="选择 Excel 文件",
-            filetypes=[("Excel 文件", "*.xlsx *.xlsm"), ("所有文件", "*.*")],
+            filetypes=[("Excel 文件", "*.xlsx *.xls *.xlsm"), ("所有文件", "*.*")],
         )
         self._add_files(list(paths))
 
@@ -238,13 +239,6 @@ class BeisiExcelExtractor:
         for p in paths:
             p = p.strip()
             if p and p not in self.files:
-                ext = os.path.splitext(p)[1].lower()
-                if ext == ".xls":
-                    messagebox.showwarning(
-                        "格式不支持",
-                        f"文件 {os.path.basename(p)} 为旧版 .xls 格式，请先转换为 .xlsx 后再处理。",
-                    )
-                    continue
                 self.files.append(p)
                 self.file_listbox.insert(tk.END, os.path.basename(p))
         self.file_count_label.config(text=f"已选 {len(self.files)} 个文件")
@@ -291,14 +285,58 @@ class BeisiExcelExtractor:
             idx = idx * 26 + (ord(ch) - ord("A") + 1)
         return idx - 1
 
+    def _load_xls(self, fpath: str, col_idx: int, s: int, e: int,
+                  has_header: bool, footer_rows: int) -> openpyxl.Workbook:
+        """
+        用 xlrd 读取旧版 .xls 文件，提取指定列字符，
+        返回一个 openpyxl Workbook 以便统一用 openpyxl 保存为 .xlsx。
+        输出文件名后缀统一改为 .xlsx。
+        """
+        xls_wb = xlrd.open_workbook(fpath)
+        new_wb = openpyxl.Workbook()
+        new_wb.remove(new_wb.active)  # 移除默认空sheet
+
+        for sheet in xls_wb.sheets():
+            new_ws = new_wb.create_sheet(title=sheet.name)
+            all_rows = [sheet.row(r) for r in range(sheet.nrows)]
+            data_rows_idx = list(range(len(all_rows)))
+
+            if has_header and data_rows_idx:
+                data_rows_idx = data_rows_idx[1:]
+            if footer_rows > 0 and len(data_rows_idx) > footer_rows:
+                data_rows_idx = data_rows_idx[:-footer_rows]
+
+            for r_idx, row in enumerate(all_rows):
+                for c_idx, cell in enumerate(row):
+                    # 对目标列且属于数据行范围的单元格进行提取
+                    if c_idx == col_idx and r_idx in data_rows_idx:
+                        val = str(cell.value) if cell.value is not None and cell.value != "" else ""
+                        # xlrd 读取数字时可能带 .0，需处理
+                        if cell.ctype == xlrd.XL_CELL_NUMBER and cell.value == int(cell.value):
+                            val = str(int(cell.value))
+                        new_ws.cell(row=r_idx + 1, column=c_idx + 1, value=val[s:e])
+                    else:
+                        # 其余单元格原样写入
+                        ctype = cell.ctype
+                        if ctype == xlrd.XL_CELL_EMPTY:
+                            val = None
+                        elif ctype == xlrd.XL_CELL_NUMBER:
+                            val = int(cell.value) if cell.value == int(cell.value) else cell.value
+                        elif ctype == xlrd.XL_CELL_DATE:
+                            val = cell.value  # 保留原始数值，日期格式暂不转换
+                        else:
+                            val = cell.value
+                        new_ws.cell(row=r_idx + 1, column=c_idx + 1, value=val)
+
+        return new_wb
+
     def _process_files(self):
         files = self.files[:]
         total = len(files)
         col = self.col_letter.get().strip().upper()
         col_idx = self._col_letter_to_index(col)
-        # 起始位/结束位均为1-based，转为Python切片的0-based索引
         s = self.start_pos.get() - 1   # 转为0-based
-        e = self.end_pos.get()          # end_pos本身是包含的第几位，切片时end = end_pos（不减1）
+        e = self.end_pos.get()          # slice end（包含第e位）
         out_dir = self.output_dir.get()
         has_header = self.has_header.get()
         has_footer = self.has_footer.get()
@@ -312,22 +350,30 @@ class BeisiExcelExtractor:
             self._update_progress(i, total, f"正在处理: {fname}", start_time, i)
 
             try:
-                wb = openpyxl.load_workbook(fpath, data_only=True)
-                for ws in wb.worksheets:
-                    all_rows = list(ws.iter_rows())
-                    data_rows = all_rows
-                    if has_header and data_rows:
-                        data_rows = data_rows[1:]
-                    if footer_rows > 0 and len(data_rows) > footer_rows:
-                        data_rows = data_rows[:-footer_rows]
+                ext = os.path.splitext(fpath)[1].lower()
 
-                    for row in data_rows:
-                        if col_idx < len(row):
-                            cell = row[col_idx]
-                            val = str(cell.value) if cell.value is not None else ""
-                            cell.value = val[s:e]
+                if ext == ".xls":
+                    # 旧版格式：用 xlrd 读取，转换后保存为 .xlsx
+                    wb = self._load_xls(fpath, col_idx, s, e, has_header, footer_rows)
+                    out_fname = os.path.splitext(fname)[0] + ".xlsx"
+                else:
+                    # .xlsx / .xlsm：用 openpyxl 直接处理
+                    wb = openpyxl.load_workbook(fpath, data_only=True)
+                    for ws in wb.worksheets:
+                        all_rows = list(ws.iter_rows())
+                        data_rows = all_rows
+                        if has_header and data_rows:
+                            data_rows = data_rows[1:]
+                        if footer_rows > 0 and len(data_rows) > footer_rows:
+                            data_rows = data_rows[:-footer_rows]
+                        for row in data_rows:
+                            if col_idx < len(row):
+                                cell = row[col_idx]
+                                val = str(cell.value) if cell.value is not None else ""
+                                cell.value = val[s:e]
+                    out_fname = fname
 
-                out_path = os.path.join(out_dir, fname)
+                out_path = os.path.join(out_dir, out_fname)
                 base, suffix = os.path.splitext(out_path)
                 counter = 1
                 while os.path.exists(out_path):
@@ -347,8 +393,6 @@ class BeisiExcelExtractor:
         elapsed = time.time() - start_time
         speed = processed / elapsed if elapsed > 0 and processed > 0 else 0
         speed_text = f"{speed:.1f} 文件/秒" if speed > 0 else ""
-
-        # FIX: 使用独立 after 调用，避免 lambda 逗号表达式返回元组导致控件不更新
         self.root.after(0, lambda v=pct: self.progress_bar.configure(value=v))
         self.root.after(0, lambda m=msg: self.progress_label.config(text=m))
         self.root.after(0, lambda st=speed_text: self.speed_label.config(text=st))
